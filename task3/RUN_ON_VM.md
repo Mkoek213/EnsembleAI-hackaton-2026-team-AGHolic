@@ -18,10 +18,10 @@ Daily baseline (stary wariant):
 python build_daily_features.py --data-dir . --chunksize 300000 --flush-every 20
 ```
 
-Sekwencyjny wariant bez dzielenia tylko na dni (rekomendowany start: `1H`):
+Sekwencyjny wariant bez dzielenia tylko na dni (rekomendowany start: `1h`):
 
 ```bash
-python build_daily_features.py --data-dir . --freq 1H --chunksize 300000 --flush-every 20 --out out/time_features_1h.csv
+python build_daily_features.py --data-dir . --freq 1h --chunksize 300000 --flush-every 20 --out out/time_features_1h.csv
 ```
 
 Szybki smoke test:
@@ -46,6 +46,12 @@ GPU run (CatBoost, `1H` features, rekomendowany do lepszej generalizacji):
 
 ```bash
 python -u train_and_submit.py --data-dir . --daily-path out/time_features_1h.csv --submission-path out/submission_seq_1h_gpu.csv --save-cv out/cv_results_seq_1h_gpu.csv --model-backend catboost_gpu --model-strength heavy --catboost-iterations 20000 --catboost-log-every 100 --corr-top-n 30 | tee out/train_seq_1h_gpu.log
+```
+
+Raw 5-minute pipeline (bez agregacji do dni/godzin; miesięczna średnia dopiero na końcu):
+
+```bash
+python -u train_and_submit_raw.py --data-dir . --submission-path out/submission_raw_seq_gpu.csv --save-cv out/cv_results_raw_seq_gpu.csv --model-backend catboost_gpu --model-strength strong --catboost-iterations 12000 --catboost-log-every 100 --train-sample-frac 1.0 | tee out/train_raw_seq_gpu.log
 ```
 
 Bardzo ciężki GPU run (tylko jeśli chcesz bardzo długi trening):

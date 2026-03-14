@@ -44,7 +44,7 @@ def parse_args() -> argparse.Namespace:
         "--freq",
         type=str,
         default="D",
-        help="Time bucket frequency for aggregation (e.g. D, 6H, 3H, 1H, 30min).",
+        help="Time bucket frequency for aggregation (e.g. D, 6h, 3h, 1h, 30min).",
     )
     return parser.parse_args()
 

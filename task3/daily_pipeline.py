@@ -6,6 +6,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from pandas.tseries.frequencies import to_offset
 from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.metrics import mean_absolute_error
 
@@ -42,6 +43,31 @@ def _fmt_duration(seconds: float) -> str:
     if hours > 0:
         return f"{hours:02d}:{minutes:02d}:{sec:02d}"
     return f"{minutes:02d}:{sec:02d}"
+
+
+def _normalize_bucket_freq(bucket_freq: str) -> str:
+    """Normalize user-provided frequency across pandas versions."""
+    freq = str(bucket_freq).strip()
+    if not freq:
+        raise ValueError("bucket_freq cannot be empty.")
+
+    # First try as provided (works for many aliases like 'D').
+    try:
+        to_offset(freq)
+        return freq
+    except ValueError:
+        pass
+
+    # Newer/stricter pandas versions often require lower-case intraday aliases.
+    freq_lower = freq.lower()
+    try:
+        to_offset(freq_lower)
+        return freq_lower
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid bucket frequency '{bucket_freq}'. "
+            "Examples: D, 12h, 6h, 3h, 1h, 30min."
+        ) from exc
 
 
 def find_data_dir(default: str = "task3") -> Path:
@@ -198,8 +224,9 @@ def build_time_features(
     chunksize: int = 300_000,
     flush_every: int = 20,
     max_chunks: int | None = None,
-    bucket_freq: str = "1H",
+    bucket_freq: str = "1h",
 ) -> pd.DataFrame:
+    normalized_bucket_freq = _normalize_bucket_freq(bucket_freq)
     usecols = ["deviceId", "timedate", "period", "x3", "deviceType"] + BASE_NUM_COLS + ["x2"]
 
     dtype: dict[str, str] = {
@@ -222,7 +249,9 @@ def build_time_features(
     )
 
     for idx, chunk in enumerate(reader, start=1):
-        partial_frames.append(aggregate_chunk(chunk, BASE_NUM_COLS, bucket_freq=bucket_freq))
+        partial_frames.append(
+            aggregate_chunk(chunk, BASE_NUM_COLS, bucket_freq=normalized_bucket_freq)
+        )
 
         if idx % 5 == 0:
             print(f"Processed chunks: {idx}")
