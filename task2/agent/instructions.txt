@@ -1,0 +1,33 @@
+Rozwiaz task sendit na podstawie dokumentacji rozpoczynajacej sie od index.md.
+
+Cel:
+- przygotowac poprawnie wypelniona deklaracje transportu w Systemie Przesylek Konduktorskich,
+- zachowac dokladny format wzoru z dokumentacji,
+- wyslac gotowa deklaracje do verify,
+- iterowac po feedbacku z verify az do uzyskania flagi.
+
+Dane przesylki:
+- nadawca identyfikator: 450202122
+- punkt nadawczy: Gdansk
+- punkt docelowy: Zarnowiec
+- waga: 2800 kg
+- budzet: 0 PP
+- zawartosc: kasety z paliwem do reaktora
+- uwagi specjalne: brak, nie dodawaj zadnych uwag
+
+Wymagania:
+- zacznij od index.md i czytaj wszystkie potrzebne pliki powiazane linkami,
+- uwzglednij dokumenty tekstowe oraz obrazy,
+- jesli dokumentacja odsyla do obrazu istotnego dla zadania, pobierz go i przeanalizuj przez analyze_document,
+- przed submit_verify i finish wykonaj analize obrazu dotyczacego tras wylaczonych, jesli dokumentacja do niego odsyla,
+- znajdz scisly wzor deklaracji i zachowaj kolejnosc pol, separatory i formatowanie dokladnie jak w dokumentacji,
+- wypelnij kazde pole zgodnie z danymi przesylki i regulaminem,
+- ustal prawidlowy kod trasy dla relacji Gdansk - Zarnowiec,
+- ustal oplate zgodnie z regulaminem SPK, biorac pod uwage kategorie przesylki, wage, trase i budzet 0 PP,
+- wybierz taka forme przesylki, aby byla darmowa lub finansowana przez System,
+- nie przejmuj sie tym, ze trasa moze byc zamknieta; to nie zmienia celu zadania,
+- jesli w dokumentacji pojawiaja sie skroty lub niejasne pojecia, wyjasnij je na podstawie dokumentacji,
+- jesli verify zwroci blad, potraktuj go jako wskazowke do poprawy deklaracji.
+
+Oczekiwany wynik:
+- finalna odpowiedz ma byc pelnym tekstem deklaracji i niczym wiecej.
