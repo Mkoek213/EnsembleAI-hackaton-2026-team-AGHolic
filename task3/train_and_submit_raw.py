@@ -76,6 +76,12 @@ def parse_args() -> argparse.Namespace:
         help="Override CatBoost iterations.",
     )
     parser.add_argument(
+        "--final-iterations",
+        type=int,
+        default=None,
+        help="Override iterations for final fit only. Default: auto from CV best iterations.",
+    )
+    parser.add_argument(
         "--catboost-log-every",
         type=int,
         default=100,
@@ -92,6 +98,17 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=42,
         help="Random seed.",
+    )
+    parser.add_argument(
+        "--warm-threshold",
+        type=float,
+        default=0.55,
+        help="Normalized outdoor-temp threshold used for heating/cooling proxies.",
+    )
+    parser.add_argument(
+        "--disable-train-weights",
+        action="store_true",
+        help="Disable season-adaptation sample weights during fitting.",
     )
     parser.add_argument(
         "--quiet",
@@ -170,12 +187,21 @@ def _prepare_X(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
     return df[cols].replace([np.inf, -np.inf], np.nan).fillna(0.0).astype("float32")
 
 
+def _to_ym(df: pd.DataFrame) -> pd.Series:
+    # Avoid int16 overflow: 2025 * 100 does not fit in int16.
+    return df["year"].astype("int32") * 100 + df["month"].astype("int32")
+
+
 def _feature_columns(df: pd.DataFrame) -> list[str]:
     excluded = {"deviceId", "timedate", "date", "period", "x2", "ym"}
     return [c for c in df.columns if c not in excluded]
 
 
-def _build_raw_features(data_dir: Path, verbose: bool = False) -> pd.DataFrame:
+def _build_raw_features(
+    data_dir: Path,
+    warm_threshold: float = 0.55,
+    verbose: bool = False,
+) -> pd.DataFrame:
     csv_path = data_dir / "data.csv"
     if not csv_path.exists():
         raise FileNotFoundError(f"Missing input CSV: {csv_path}")
@@ -222,6 +248,16 @@ def _build_raw_features(data_dir: Path, verbose: bool = False) -> pd.DataFrame:
     df["delta_t9_t1"] = df["t9"] - df["t1"]
     df["active"] = (df["x1"] > 0).astype("float32")
 
+    # Domain-aware proxies for heat-pump demand regimes.
+    thr = np.float32(warm_threshold)
+    df["hdh"] = np.maximum(0.0, thr - df["t1"]).astype("float32")
+    df["cdh"] = np.maximum(0.0, df["t1"] - thr).astype("float32")
+    df["lift_load_outdoor"] = (df["t5"] - df["t1"]).astype("float32")
+    df["lift_circuit_outdoor"] = (df["t8"] - df["t1"]).astype("float32")
+    df["compressor_heat_proxy"] = (df["x1"] * df["hdh"]).astype("float32")
+    df["compressor_cool_proxy"] = (df["x1"] * df["cdh"]).astype("float32")
+    df["defrost_proxy"] = np.maximum(0.0, df["t5"] - df["t8"]).astype("float32")
+
     devices_path = data_dir / "devices.csv"
     if devices_path.exists():
         devices = pd.read_csv(devices_path, usecols=["deviceId", "latitude", "longitude"])
@@ -264,6 +300,25 @@ def _build_raw_features(data_dir: Path, verbose: bool = False) -> pd.DataFrame:
     return df
 
 
+def _compute_train_weights(train_df: pd.DataFrame) -> np.ndarray:
+    # Weight recent months and warmer rows stronger to improve winter->summer transfer.
+    ym = train_df["ym"].astype("int32")
+    ym_min = int(ym.min())
+    ym_max = int(ym.max())
+    denom = max(1, ym_max - ym_min)
+    w_recent = 0.8 + 0.4 * ((ym - ym_min) / denom)
+
+    t1 = train_df["t1"].astype("float32")
+    q10 = float(np.nanquantile(t1, 0.10))
+    q90 = float(np.nanquantile(t1, 0.90))
+    temp_span = max(1e-6, q90 - q10)
+    t1_norm = np.clip((t1 - q10) / temp_span, 0.0, 1.0)
+    w_warm = 0.7 + 0.6 * t1_norm
+
+    weights = (w_recent * w_warm).astype("float32")
+    return np.clip(weights, 0.2, 3.0)
+
+
 def _sample_train(
     train_df: pd.DataFrame,
     sample_frac: float,
@@ -299,8 +354,12 @@ def run_cv(
     catboost_log_every: int,
     train_sample_frac: float,
     seed: int,
+    use_train_weights: bool,
     verbose: bool,
 ) -> pd.DataFrame:
+    labelled = labelled.copy()
+    labelled["x2"] = pd.to_numeric(labelled["x2"], errors="coerce").astype("float32")
+
     valid_months = sorted(m for m in labelled["ym"].unique() if m >= first_valid_ym)
     rows: list[dict[str, float | int]] = []
     total = len(valid_months)
@@ -322,8 +381,16 @@ def run_cv(
 
         device_mean = train_df.groupby("deviceId", observed=True)["x2"].mean()
         global_mean = train_df["x2"].mean()
-        train_base = train_df["deviceId"].map(device_mean).fillna(global_mean)
-        valid_base = valid_df["deviceId"].map(device_mean).fillna(global_mean)
+        train_base = (
+            pd.to_numeric(train_df["deviceId"].map(device_mean), errors="coerce")
+            .fillna(global_mean)
+            .astype("float32")
+        )
+        valid_base = (
+            pd.to_numeric(valid_df["deviceId"].map(device_mean), errors="coerce")
+            .fillna(global_mean)
+            .astype("float32")
+        )
 
         model = _make_catboost(
             backend=model_backend,
@@ -335,15 +402,24 @@ def run_cv(
         )
         X_train = _prepare_X(train_df, cols)
         X_valid = _prepare_X(valid_df, cols)
-        y_train_res = train_df["x2"] - train_base
-        y_valid_res = valid_df["x2"] - valid_base
+        y_train_res = train_df["x2"].astype("float32") - train_base
+        y_valid_res = valid_df["x2"].astype("float32") - valid_base
+        train_weights = _compute_train_weights(train_df) if use_train_weights else None
         model.fit(
             X_train,
             y_train_res,
             eval_set=(X_valid, y_valid_res),
             use_best_model=True,
             early_stopping_rounds=1000,
+            sample_weight=train_weights,
         )
+        best_iter = None
+        try:
+            best_iter_raw = int(model.get_best_iteration())
+            # CatBoost returns 0-based iteration index.
+            best_iter = best_iter_raw + 1 if best_iter_raw >= 0 else None
+        except Exception:
+            best_iter = None
 
         valid_pred = (valid_base + model.predict(X_valid)).clip(lower=0.0)
         valid_eval = valid_df[["deviceId", "year", "month", "x2"]].copy()
@@ -374,6 +450,7 @@ def run_cv(
                 "baseline_monthly_mae": float(baseline_mae_monthly),
                 "model_monthly_mae": float(model_mae_monthly),
                 "model_row_mae": float(row_mae),
+                "best_iteration": int(best_iter) if best_iter else np.nan,
             }
         )
 
@@ -402,6 +479,7 @@ def train_final_and_submit(
     catboost_log_every: int,
     train_sample_frac: float,
     seed: int,
+    use_train_weights: bool,
     verbose: bool,
 ) -> pd.DataFrame:
     labelled = full_df[full_df["x2"].notna()].copy()
@@ -410,17 +488,26 @@ def train_final_and_submit(
     if labelled.empty or forecast.empty:
         raise RuntimeError("Labelled or forecast split is empty.")
 
-    labelled["ym"] = labelled["year"] * 100 + labelled["month"]
+    labelled["x2"] = pd.to_numeric(labelled["x2"], errors="coerce").astype("float32")
+    labelled["ym"] = _to_ym(labelled)
     labelled_fit = _sample_train(labelled, train_sample_frac, seed)
 
     device_mean = labelled_fit.groupby("deviceId", observed=True)["x2"].mean()
     global_mean = labelled_fit["x2"].mean()
-    train_base = labelled_fit["deviceId"].map(device_mean).fillna(global_mean)
+    train_base = (
+        pd.to_numeric(labelled_fit["deviceId"].map(device_mean), errors="coerce")
+        .fillna(global_mean)
+        .astype("float32")
+    )
 
     X_train = _prepare_X(labelled_fit, cols)
-    y_train_res = labelled_fit["x2"] - train_base
+    y_train_res = labelled_fit["x2"].astype("float32") - train_base
     X_forecast = _prepare_X(forecast, cols)
-    forecast_base = forecast["deviceId"].map(device_mean).fillna(global_mean)
+    forecast_base = (
+        pd.to_numeric(forecast["deviceId"].map(device_mean), errors="coerce")
+        .fillna(global_mean)
+        .astype("float32")
+    )
 
     model = _make_catboost(
         backend=model_backend,
@@ -436,7 +523,8 @@ def train_final_and_submit(
             f"[FINAL RAW] fit_rows={len(labelled_fit)} forecast_rows={len(forecast)} "
             f"features={len(cols)}"
         )
-    model.fit(X_train, y_train_res)
+    train_weights = _compute_train_weights(labelled_fit) if use_train_weights else None
+    model.fit(X_train, y_train_res, sample_weight=train_weights)
     if verbose:
         print(f"[FINAL RAW] fit done in {_fmt_duration(time.perf_counter() - fit_start)}")
 
@@ -481,11 +569,15 @@ def main() -> None:
 
     print(f"Data dir: {data_dir.resolve()}")
     print("Building raw 5-minute feature table...")
-    raw_df = _build_raw_features(data_dir=data_dir, verbose=verbose)
+    raw_df = _build_raw_features(
+        data_dir=data_dir,
+        warm_threshold=args.warm_threshold,
+        verbose=verbose,
+    )
     print(f"Raw feature shape: {raw_df.shape}")
 
     labelled = raw_df[raw_df["x2"].notna()].copy()
-    labelled["ym"] = labelled["year"] * 100 + labelled["month"]
+    labelled["ym"] = _to_ym(labelled)
     cols = _feature_columns(labelled)
     print(f"Model feature count: {len(cols)}")
 
@@ -500,6 +592,7 @@ def main() -> None:
         catboost_log_every=args.catboost_log_every,
         train_sample_frac=args.train_sample_frac,
         seed=args.random_seed,
+        use_train_weights=not args.disable_train_weights,
         verbose=verbose,
     )
     if cv_df.empty:
@@ -515,6 +608,20 @@ def main() -> None:
             cv_df.to_csv(save_path, index=False)
             print(f"Saved CV table: {save_path.resolve()}")
 
+    final_iterations = args.final_iterations
+    if final_iterations is None and not cv_df.empty and "best_iteration" in cv_df.columns:
+        best_iters = cv_df["best_iteration"].dropna().astype("int32")
+        if not best_iters.empty:
+            # Slightly above median best iteration for safer generalization.
+            final_iterations = int(np.clip(round(best_iters.median() * 1.2), 300, 20000))
+            print(
+                f"Auto final iterations from CV best_iteration: "
+                f"median={int(best_iters.median())} -> final_iterations={final_iterations}"
+            )
+    if final_iterations is None:
+        final_iterations = args.catboost_iterations
+    print(f"Final fit iterations: {final_iterations}")
+
     print("Training final model and creating submission...")
     submission = train_final_and_submit(
         full_df=raw_df,
@@ -522,10 +629,11 @@ def main() -> None:
         submission_path=submission_path,
         model_backend=args.model_backend,
         model_strength=args.model_strength,
-        catboost_iterations=args.catboost_iterations,
+        catboost_iterations=final_iterations,
         catboost_log_every=args.catboost_log_every,
         train_sample_frac=args.train_sample_frac,
         seed=args.random_seed,
+        use_train_weights=not args.disable_train_weights,
         verbose=verbose,
     )
 

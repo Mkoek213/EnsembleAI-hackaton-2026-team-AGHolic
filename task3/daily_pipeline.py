@@ -77,6 +77,66 @@ def find_data_dir(default: str = "task3") -> Path:
     raise FileNotFoundError("data.csv not found in current directory or task3/")
 
 
+def load_time_features_csv(
+    csv_path: Path,
+    labelled_only: bool = False,
+    chunksize: int | None = None,
+    verbose: bool = False,
+) -> pd.DataFrame:
+    sample = pd.read_csv(csv_path, nrows=5)
+    dtype: dict[str, str] = {}
+    for col in sample.columns:
+        if col == "date":
+            continue
+        if col == "deviceId":
+            dtype[col] = "string"
+        elif col == "period":
+            dtype[col] = "category"
+        elif col in {"year", "dayofyear"}:
+            dtype[col] = "int16"
+        elif col in {"month", "weekday", "hour", "minute", "is_weekend"}:
+            dtype[col] = "int8"
+        elif col in {"deviceType", "x3"}:
+            dtype[col] = "Int16"
+        elif col == "n_rows":
+            dtype[col] = "int32"
+        else:
+            dtype[col] = "float32"
+
+    read_kwargs: dict[str, Any] = {
+        "parse_dates": ["date"],
+        "dtype": dtype,
+        "low_memory": False,
+    }
+
+    if chunksize is None and not labelled_only:
+        return pd.read_csv(csv_path, **read_kwargs)
+
+    effective_chunksize = int(chunksize or 250_000)
+    frames: list[pd.DataFrame] = []
+    total_rows = 0
+    kept_rows = 0
+
+    for idx, chunk in enumerate(pd.read_csv(csv_path, chunksize=effective_chunksize, **read_kwargs), start=1):
+        total_rows += len(chunk)
+        if labelled_only:
+            chunk = chunk[chunk["target_x2"].notna()].copy()
+        kept_rows += len(chunk)
+        if len(chunk) > 0:
+            frames.append(chunk)
+        if verbose and idx % 10 == 0:
+            print(
+                f"[LOAD] chunks={idx} rows_seen={total_rows} rows_kept={kept_rows} "
+                f"labelled_only={labelled_only}"
+            )
+
+    if not frames:
+        empty = sample.iloc[0:0].copy()
+        return empty
+
+    return pd.concat(frames, ignore_index=True)
+
+
 def aggregate_chunk(
     chunk: pd.DataFrame,
     base_cols: list[str],
@@ -390,19 +450,48 @@ def prepare_X(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
     return df[cols].replace([np.inf, -np.inf], np.nan).fillna(0.0).astype("float32")
 
 
-def feature_columns(daily: pd.DataFrame) -> list[str]:
+def feature_columns(
+    daily: pd.DataFrame,
+    feature_mode: str = "full",
+) -> list[str]:
     excluded_cols = {"deviceId", "date", "period", "target_x2", "ym"}
-    return [c for c in daily.columns if c not in excluded_cols]
+    cols = [c for c in daily.columns if c not in excluded_cols]
+
+    selected_mode = str(feature_mode).strip().lower()
+    if selected_mode == "full":
+        return cols
+    if selected_mode == "no_raw_calendar":
+        raw_calendar = {"year", "month", "dayofyear", "weekday", "hour", "minute"}
+        return [c for c in cols if c not in raw_calendar and not c.endswith("_month_inter")]
+
+    raise ValueError(
+        f"Unknown feature_mode: {feature_mode}. Supported: full, no_raw_calendar"
+    )
+
+
+def aggregate_bucket_predictions_to_monthly(
+    df: pd.DataFrame,
+    pred_col: str,
+    target_col: str = "target_x2",
+) -> pd.DataFrame:
+    return (
+        df.groupby(["deviceId", "year", "month"], as_index=False)
+        .agg(prediction=(pred_col, "mean"), target=(target_col, "mean"))
+        .sort_values(["deviceId", "year", "month"])
+        .reset_index(drop=True)
+    )
 
 
 def enrich_daily_with_sequence_features(
     daily: pd.DataFrame,
     data_dir: Path | None = None,
     verbose: bool = False,
+    include_geo: bool = True,
+    include_sequence: bool = True,
 ) -> pd.DataFrame:
     df = daily.sort_values(["deviceId", "date"]).copy()
 
-    if data_dir is not None:
+    if include_geo and data_dir is not None:
         devices_path = data_dir / "devices.csv"
         if devices_path.exists():
             devices = pd.read_csv(
@@ -417,6 +506,9 @@ def enrich_daily_with_sequence_features(
                     f"[FE] merged devices.csv ({len(devices)} rows), "
                     f"feature count now: {len(df.columns)}"
                 )
+
+    if not include_sequence:
+        return df
 
     seq_cols = [c for c in SEQ_SOURCE_CANDIDATES if c in df.columns]
     if verbose:
@@ -462,8 +554,16 @@ def enrich_daily_with_sequence_features(
         c for c in ["t8_mean", "t5_mean", "t13_mean", "active_ratio", "x1_mean"] if c in df.columns
     ]
     for col in center_cols:
-        dev_mean = group[col].transform("mean")
-        new_cols[f"{col}_dev_center"] = df[col] - dev_mean
+        hist_mean = (
+            group[col]
+            .shift(1)
+            .groupby(df["deviceId"], sort=False)
+            .expanding()
+            .mean()
+            .reset_index(level=0, drop=True)
+        )
+        new_cols[f"{col}_hist_mean"] = hist_mean
+        new_cols[f"{col}_dev_center"] = df[col] - hist_mean
         new_cols[f"{col}_month_inter"] = df[col] * df["month"]
 
     if new_cols:
@@ -501,6 +601,45 @@ def top_target_correlations(
     )
 
 
+def compute_train_weights(
+    train_df: pd.DataFrame,
+    mode: str = "none",
+) -> np.ndarray | None:
+    selected_mode = str(mode).strip().lower()
+    if selected_mode == "none":
+        return None
+
+    weights = np.ones(len(train_df), dtype=np.float32)
+
+    if "device_month_equal" in selected_mode:
+        month_counts = (
+            train_df.groupby(["deviceId", "year", "month"])["deviceId"]
+            .transform("size")
+            .astype("float32")
+        )
+        weights *= 1.0 / np.clip(month_counts.to_numpy(dtype=np.float32), 1.0, None)
+
+    if "recent" in selected_mode:
+        ym = train_df["ym"].astype("int32")
+        ym_min = int(ym.min())
+        ym_max = int(ym.max())
+        denom = max(1, ym_max - ym_min)
+        recent = 0.8 + 0.4 * ((ym - ym_min) / denom)
+        weights *= recent.to_numpy(dtype=np.float32)
+
+    if "warm" in selected_mode:
+        t1 = train_df["t1_mean"].astype("float32") if "t1_mean" in train_df.columns else None
+        if t1 is not None:
+            q10 = float(np.nanquantile(t1, 0.10))
+            q90 = float(np.nanquantile(t1, 0.90))
+            temp_span = max(1e-6, q90 - q10)
+            t1_norm = np.clip((t1 - q10) / temp_span, 0.0, 1.0)
+            warm = 0.7 + 0.6 * t1_norm
+            weights *= warm.to_numpy(dtype=np.float32)
+
+    return np.clip(weights.astype(np.float32), 1e-4, 10.0)
+
+
 def evaluate_rolling_months(
     labelled_df: pd.DataFrame,
     cols: list[str],
@@ -510,6 +649,7 @@ def evaluate_rolling_months(
     model_strength: str = "strong",
     catboost_iterations: int | None = None,
     catboost_log_every: int = 100,
+    sample_weight_mode: str = "none",
 ) -> pd.DataFrame:
     valid_months = sorted(m for m in labelled_df["ym"].unique() if m >= first_valid_ym)
     rows: list[dict[str, float | int]] = []
@@ -518,7 +658,8 @@ def evaluate_rolling_months(
     if verbose:
         print(
             f"[CV] model_backend={model_backend}, model_strength={model_strength}, "
-            f"folds={total_folds}, catboost_iterations={catboost_iterations or 'default'}"
+            f"folds={total_folds}, catboost_iterations={catboost_iterations or 'default'}, "
+            f"sample_weight_mode={sample_weight_mode}"
         )
 
     for fold_idx, valid_ym in enumerate(valid_months, start=1):
@@ -545,8 +686,6 @@ def evaluate_rolling_months(
         train_base = train_df["deviceId"].map(device_mean).fillna(global_mean)
         valid_base = valid_df["deviceId"].map(device_mean).fillna(global_mean)
 
-        baseline_mae = mean_absolute_error(valid_df["target_x2"], valid_base)
-
         X_train = prepare_X(train_df, cols)
         X_valid = prepare_X(valid_df, cols)
         y_train_residual = train_df["target_x2"] - train_base
@@ -567,25 +706,59 @@ def evaluate_rolling_months(
                 "early_stopping_rounds": 800,
             }
 
+        train_weights = compute_train_weights(train_df, mode=sample_weight_mode)
+        if train_weights is not None:
+            fit_kwargs["sample_weight"] = train_weights
+
         model.fit(X_train, y_train_residual, **fit_kwargs)
+        best_iter = np.nan
         if verbose and _is_catboost_backend(model_backend):
             try:
-                best_iter = model.get_best_iteration()
+                best_iter_raw = int(model.get_best_iteration())
+                if best_iter_raw >= 0:
+                    best_iter = best_iter_raw + 1
                 print(f"[CV {fold_idx}/{total_folds}] best_iteration={best_iter}")
             except Exception:
                 pass
 
         valid_residual = model.predict(X_valid)
         valid_pred = (valid_base + valid_residual).clip(lower=0.0)
-        model_mae = mean_absolute_error(valid_df["target_x2"], valid_pred)
+        row_mae = mean_absolute_error(valid_df["target_x2"], valid_pred)
+
+        valid_eval = valid_df[["deviceId", "year", "month", "target_x2"]].copy()
+        valid_eval["prediction_row"] = valid_pred.astype("float32")
+
+        monthly_pred = aggregate_bucket_predictions_to_monthly(
+            valid_eval,
+            pred_col="prediction_row",
+            target_col="target_x2",
+        )
+        model_monthly_mae = mean_absolute_error(monthly_pred["target"], monthly_pred["prediction"])
+
+        monthly_baseline = (
+            valid_eval.groupby(["deviceId", "year", "month"], as_index=False)
+            .agg(target=("target_x2", "mean"))
+            .sort_values(["deviceId", "year", "month"])
+            .reset_index(drop=True)
+        )
+        monthly_baseline["prediction"] = (
+            monthly_baseline["deviceId"].map(device_mean).fillna(global_mean).astype("float32")
+        )
+        baseline_monthly_mae = mean_absolute_error(
+            monthly_baseline["target"],
+            monthly_baseline["prediction"],
+        )
 
         rows.append(
             {
                 "valid_ym": int(valid_ym),
                 "train_rows": len(train_df),
                 "valid_rows": len(valid_df),
-                "baseline_mae": float(baseline_mae),
-                "model_mae": float(model_mae),
+                "monthly_rows": int(len(monthly_pred)),
+                "baseline_monthly_mae": float(baseline_monthly_mae),
+                "model_monthly_mae": float(model_monthly_mae),
+                "model_row_mae": float(row_mae),
+                "best_iteration": best_iter,
             }
         )
 
@@ -596,7 +769,8 @@ def evaluate_rolling_months(
             eta = avg_fold * (total_folds - fold_idx)
             print(
                 f"[CV {fold_idx}/{total_folds}] done "
-                f"baseline_mae={baseline_mae:.6f} model_mae={model_mae:.6f} "
+                f"baseline_monthly_mae={baseline_monthly_mae:.6f} "
+                f"model_monthly_mae={model_monthly_mae:.6f} row_mae={row_mae:.6f} "
                 f"fold_time={_fmt_duration(fold_time)} elapsed={_fmt_duration(elapsed)} "
                 f"eta={_fmt_duration(eta)}"
             )
@@ -612,20 +786,22 @@ def train_and_predict_monthly(
     model_strength: str = "strong",
     catboost_iterations: int | None = None,
     catboost_log_every: int = 100,
+    sample_weight_mode: str = "none",
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     stage_start = time.perf_counter()
     labelled = daily[daily["target_x2"].notna()].copy()
     forecast = daily[daily["target_x2"].isna()].copy()
 
-    labelled["ym"] = labelled["year"] * 100 + labelled["month"]
-    forecast["ym"] = forecast["year"] * 100 + forecast["month"]
+    labelled["ym"] = labelled["year"].astype("int32") * 100 + labelled["month"].astype("int32")
+    forecast["ym"] = forecast["year"].astype("int32") * 100 + forecast["month"].astype("int32")
     cols = feature_columns(labelled)
     if verbose:
         print(
             f"[FINAL] labelled_rows={len(labelled)} forecast_rows={len(forecast)} "
             f"features={len(cols)} model_backend={model_backend} "
             f"model_strength={model_strength} "
-            f"catboost_iterations={catboost_iterations or 'default'}"
+            f"catboost_iterations={catboost_iterations or 'default'} "
+            f"sample_weight_mode={sample_weight_mode}"
         )
 
     baseline_start = time.perf_counter()
@@ -652,7 +828,11 @@ def train_and_predict_monthly(
     fit_start = time.perf_counter()
     if verbose:
         print("[FINAL] fitting residual model...")
-    final_model.fit(X_labelled, y_train_residual_all)
+    train_weights = compute_train_weights(labelled, mode=sample_weight_mode)
+    fit_kwargs: dict[str, Any] = {}
+    if train_weights is not None:
+        fit_kwargs["sample_weight"] = train_weights
+    final_model.fit(X_labelled, y_train_residual_all, **fit_kwargs)
     if verbose:
         print(f"[FINAL] fit done in {_fmt_duration(time.perf_counter() - fit_start)}")
 

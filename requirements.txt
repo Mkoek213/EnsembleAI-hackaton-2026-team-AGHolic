@@ -1,0 +1,8 @@
+ipykernel
+pandas
+dotenv
+openai
+mcp
+langfuse
+pydantic
+requests

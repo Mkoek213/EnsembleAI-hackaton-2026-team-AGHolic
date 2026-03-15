@@ -4,6 +4,7 @@ import argparse
 from pathlib import Path
 import time
 
+import numpy as np
 import pandas as pd
 
 from daily_pipeline import (
@@ -11,6 +12,7 @@ from daily_pipeline import (
     enrich_daily_with_sequence_features,
     feature_columns,
     find_data_dir,
+    load_time_features_csv,
     top_target_correlations,
     train_and_predict_monthly,
 )
@@ -83,14 +85,44 @@ def parse_args() -> argparse.Namespace:
         help="Print top-N feature correlations with target_x2.",
     )
     parser.add_argument(
+        "--feature-mode",
+        type=str,
+        default="full",
+        choices=["full", "no_raw_calendar"],
+        help="Feature subset mode for extrapolation-sensitive runs.",
+    )
+    parser.add_argument(
         "--disable-sequence-features",
         action="store_true",
         help="Disable temporal lag/rolling feature enrichment.",
     )
     parser.add_argument(
+        "--disable-geo-features",
+        action="store_true",
+        help="Disable static geolocation metadata enrichment from devices.csv.",
+    )
+    parser.add_argument(
+        "--sample-weight-mode",
+        type=str,
+        default="none",
+        choices=[
+            "none",
+            "device_month_equal",
+            "device_month_equal_recent",
+            "device_month_equal_warm",
+            "device_month_equal_recent_warm",
+        ],
+        help="Optional causal sample weighting for row-level training.",
+    )
+    parser.add_argument(
         "--quiet",
         action="store_true",
         help="Disable detailed progress logs.",
+    )
+    parser.add_argument(
+        "--cv-only",
+        action="store_true",
+        help="Run rolling CV only and skip final fit/submission generation.",
     )
     return parser.parse_args()
 
@@ -118,23 +150,40 @@ def main() -> None:
 
     print(f"Loading feature data from: {daily_path.resolve()}")
     load_start = time.perf_counter()
-    daily = pd.read_csv(daily_path, parse_dates=["date"])
+    daily = load_time_features_csv(
+        daily_path,
+        labelled_only=args.cv_only,
+        chunksize=250_000 if args.cv_only else None,
+        verbose=verbose,
+    )
     print(f"Feature table shape: {daily.shape} (loaded in {time.perf_counter() - load_start:.1f}s)")
 
     if args.disable_sequence_features:
         print("Sequence feature enrichment: DISABLED")
     else:
-        fe_start = time.perf_counter()
-        print("Applying sequence + metadata feature enrichment...")
-        daily = enrich_daily_with_sequence_features(daily=daily, data_dir=data_dir, verbose=verbose)
-        print(
-            f"Enrichment done. Shape now: {daily.shape} "
-            f"(in {time.perf_counter() - fe_start:.1f}s)"
-        )
+        print("Sequence feature enrichment: ENABLED")
+
+    if args.disable_geo_features:
+        print("Geolocation metadata enrichment: DISABLED")
+    else:
+        print("Geolocation metadata enrichment: ENABLED")
+
+    fe_start = time.perf_counter()
+    daily = enrich_daily_with_sequence_features(
+        daily=daily,
+        data_dir=data_dir,
+        verbose=verbose,
+        include_geo=not args.disable_geo_features,
+        include_sequence=not args.disable_sequence_features,
+    )
+    print(
+        f"Enrichment done. Shape now: {daily.shape} "
+        f"(in {time.perf_counter() - fe_start:.1f}s)"
+    )
 
     labelled = daily[daily["target_x2"].notna()].copy()
-    labelled["ym"] = labelled["year"] * 100 + labelled["month"]
-    cols = feature_columns(labelled)
+    labelled["ym"] = labelled["year"].astype("int32") * 100 + labelled["month"].astype("int32")
+    cols = feature_columns(labelled, feature_mode=args.feature_mode)
     print(f"Model feature count: {len(cols)}")
 
     if args.corr_top_n > 0:
@@ -153,21 +202,45 @@ def main() -> None:
         model_strength=args.model_strength,
         catboost_iterations=args.catboost_iterations,
         catboost_log_every=args.catboost_log_every,
+        sample_weight_mode=args.sample_weight_mode,
     )
     if cv_results.empty:
         print("No CV folds generated (check cv-first-valid-ym).")
     else:
         print(cv_results.to_string(index=False))
-        print(f"Average baseline MAE: {cv_results['baseline_mae'].mean():.6f}")
-        print(f"Average model MAE:    {cv_results['model_mae'].mean():.6f}")
-        model_better = bool((cv_results["model_mae"] < cv_results["baseline_mae"]).all())
-        print(f"Model better on all folds: {model_better}")
+        print(f"Average baseline monthly MAE: {cv_results['baseline_monthly_mae'].mean():.6f}")
+        print(f"Average model monthly MAE:    {cv_results['model_monthly_mae'].mean():.6f}")
+        print(f"Average model row MAE:        {cv_results['model_row_mae'].mean():.6f}")
+        model_better = bool(
+            (cv_results["model_monthly_mae"] < cv_results["baseline_monthly_mae"]).all()
+        )
+        print(f"Model better on all folds (monthly MAE): {model_better}")
 
         if args.save_cv:
             save_cv = Path(args.save_cv)
             save_cv.parent.mkdir(parents=True, exist_ok=True)
             cv_results.to_csv(save_cv, index=False)
             print(f"Saved CV results: {save_cv.resolve()}")
+
+    final_catboost_iterations = args.catboost_iterations
+    if (
+        args.model_backend.startswith("catboost")
+        and not cv_results.empty
+        and "best_iteration" in cv_results.columns
+    ):
+        best_iters = cv_results["best_iteration"].dropna().astype("int32")
+        if not best_iters.empty:
+            median_best_iter = int(np.median(best_iters))
+            final_catboost_iterations = int(max(200, round(median_best_iter * 1.1)))
+            print(
+                "Final CatBoost iterations from rolling CV best_iteration: "
+                f"{median_best_iter} -> {final_catboost_iterations}"
+            )
+
+    if args.cv_only:
+        print("CV-only mode enabled; skipping final fit and submission generation.")
+        print(f"Total runtime: {time.perf_counter() - started:.1f}s")
+        return
 
     print("Training final model and creating submission...")
     monthly_submission, labelled_all = train_and_predict_monthly(
@@ -176,8 +249,9 @@ def main() -> None:
         verbose=verbose,
         model_backend=args.model_backend,
         model_strength=args.model_strength,
-        catboost_iterations=args.catboost_iterations,
+        catboost_iterations=final_catboost_iterations,
         catboost_log_every=args.catboost_log_every,
+        sample_weight_mode=args.sample_weight_mode,
     )
 
     forecast_device_count = daily[daily["target_x2"].isna()]["deviceId"].nunique()
